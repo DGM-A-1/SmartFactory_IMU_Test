@@ -22,6 +22,54 @@ import platform
 import sqlite3
 import uuid
 import os
+import requests  # ✅ API 호출용
+
+class LoginDialog(simpledialog.Dialog):
+    """이메일/비밀번호를 한 번에 입력받는 모달 다이얼로그"""
+    def __init__(self, parent, title="로그인"):
+        self.email = None
+        self.password = None
+        super().__init__(parent, title)
+
+    def body(self, master):
+        master.columnconfigure(1, weight=1)
+
+        tk.Label(master, text="이메일:", font=("Arial", 11, "bold")).grid(row=0, column=0, sticky="w", padx=8, pady=(10, 4))
+        self.email_var = tk.StringVar()
+        self.email_entry = ttk.Entry(master, textvariable=self.email_var, width=32)
+        self.email_entry.grid(row=0, column=1, sticky="we", padx=(0, 10), pady=(10, 4))
+
+        tk.Label(master, text="비밀번호:", font=("Arial", 11, "bold")).grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        self.pw_var = tk.StringVar()
+        self.pw_entry = ttk.Entry(master, textvariable=self.pw_var, show="*", width=32)
+        self.pw_entry.grid(row=1, column=1, sticky="we", padx=(0, 10), pady=4)
+
+        # 비밀번호 표시 토글
+        self.show_var = tk.BooleanVar(value=False)
+        self.show_chk = ttk.Checkbutton(master, text="비밀번호 표시", variable=self.show_var, command=self._toggle_pw)
+        self.show_chk.grid(row=2, column=1, sticky="w", padx=(0, 10), pady=(0, 6))
+
+        # 처음 포커스 위치
+        return self.email_entry
+
+    def _toggle_pw(self):
+        self.pw_entry.configure(show="" if self.show_var.get() else "*")
+
+    def validate(self):
+        email = (self.email_var.get() or "").strip()
+        pw = self.pw_var.get()
+        if not email:
+            messagebox.showwarning("입력 필요", "이메일을 입력하세요.")
+            return False
+        if pw is None or pw == "":
+            messagebox.showwarning("입력 필요", "비밀번호를 입력하세요.")
+            return False
+        return True
+
+    def apply(self):
+        self.email = (self.email_var.get() or "").strip()
+        self.password = self.pw_var.get()
+
 
 class IMUGUI:
     def __init__(self, root):
@@ -62,9 +110,15 @@ class IMUGUI:
         # === Local DB 저장을 위한 입력값 ===
         # 예: sqlite:///./smartfactory.db  또는  C:/data/smartfactory.db
         self.db_url_var = tk.StringVar(value="sqlite:///./smartfactory.db")
-        self.operator_name = "admin"     # 고정 표기
+        self.operator_name = "admin"     # 고정 표기(레거시)
         self.upload_box_no_var = tk.StringVar(value="")
         # Destination은 Room3으로 고정, Arrived는 업로드 시 항상 True로 저장합니다.
+
+        # ✅ API 로그인/설정 상태
+        self.api_base_var = tk.StringVar(value="http://127.0.0.1:8000")
+        self.auth_token = None
+        self.user_summary = None
+        self.operator_name_var = tk.StringVar(value=self.operator_name)
 
         # 로컬(내부용) 분석 DB 초기화 (기존 유지)
         self.init_database()
@@ -208,6 +262,11 @@ class IMUGUI:
                                   activebackground='#00a876', **btn_cfg)
         self.auto_btn.pack(side='left', padx=3, pady=10)
 
+        # ✅ 로그인 버튼 (커스텀 다이얼로그 사용)
+        tk.Button(btn_container, text="🔐 LOGIN", command=self.login_via_api,
+                  bg='#343a40', fg='white',
+                  activebackground='#23272b', **btn_cfg).pack(side='left', padx=3, pady=10)
+
         tk.Button(btn_container, text="🤖 LOAD MODEL", command=self.load_model,
                   bg=self.colors['info'], fg='white',
                   activebackground='#138496', **btn_cfg).pack(side='left', padx=3, pady=10)
@@ -277,29 +336,35 @@ class IMUGUI:
         frm = tk.Frame(upload_card, bg=self.colors['bg_light'])
         frm.pack(fill='x', padx=8, pady=8)
 
-        # DB URL (SQLite)
-        tk.Label(frm, text="DB URL (SQLite)", font=(self.font_family, 11, 'bold'),
+        # ✅ API Base
+        tk.Label(frm, text="API Base", font=(self.font_family, 11, 'bold'),
                  bg=self.colors['bg_light'], fg=self.colors['text_secondary']).grid(row=0, column=0, sticky='w')
-        tk.Entry(frm, textvariable=self.db_url_var, width=28,
+        tk.Entry(frm, textvariable=self.api_base_var, width=28,
                  font=(self.font_family, 11)).grid(row=0, column=1, sticky='we', pady=2)
 
-        # Operator (고정: admin)
-        tk.Label(frm, text="Operator", font=(self.font_family, 11, 'bold'),
+        # DB URL (SQLite)
+        tk.Label(frm, text="DB URL (SQLite)", font=(self.font_family, 11, 'bold'),
                  bg=self.colors['bg_light'], fg=self.colors['text_secondary']).grid(row=1, column=0, sticky='w')
-        tk.Label(frm, text=self.operator_name, font=(self.font_family, 11, 'bold'),
-                 bg=self.colors['bg_light'], fg=self.colors['text_primary']).grid(row=1, column=1, sticky='w', pady=2)
+        tk.Entry(frm, textvariable=self.db_url_var, width=28,
+                 font=(self.font_family, 11)).grid(row=1, column=1, sticky='we', pady=2)
+
+        # Operator (로그인 시 갱신)
+        tk.Label(frm, text="Operator", font=(self.font_family, 11, 'bold'),
+                 bg=self.colors['bg_light'], fg=self.colors['text_secondary']).grid(row=2, column=0, sticky='w')
+        tk.Label(frm, textvariable=self.operator_name_var, font=(self.font_family, 11, 'bold'),
+                 bg=self.colors['bg_light'], fg=self.colors['text_primary']).grid(row=2, column=1, sticky='w', pady=2)
 
         # Destination (고정 표기: Room3)
         tk.Label(frm, text="Destination", font=(self.font_family, 11, 'bold'),
-                 bg=self.colors['bg_light'], fg=self.colors['text_secondary']).grid(row=2, column=0, sticky='w')
+                 bg=self.colors['bg_light'], fg=self.colors['text_secondary']).grid(row=3, column=0, sticky='w')
         tk.Label(frm, text="Room3", font=(self.font_family, 11, 'bold'),
-                 bg=self.colors['bg_light'], fg=self.colors['text_primary']).grid(row=2, column=1, sticky='w', pady=2)
+                 bg=self.colors['bg_light'], fg=self.colors['text_primary']).grid(row=3, column=1, sticky='w', pady=2)
 
         # Box No (숫자)
         tk.Label(frm, text="Box No", font=(self.font_family, 11, 'bold'),
-                 bg=self.colors['bg_light'], fg=self.colors['text_secondary']).grid(row=3, column=0, sticky='w')
+                 bg=self.colors['bg_light'], fg=self.colors['text_secondary']).grid(row=4, column=0, sticky='w')
         tk.Entry(frm, textvariable=self.upload_box_no_var, width=28,
-                 font=(self.font_family, 11)).grid(row=3, column=1, sticky='we', pady=2)
+                 font=(self.font_family, 11)).grid(row=4, column=1, sticky='we', pady=2)
 
         for i in range(2):
             frm.grid_columnconfigure(i, weight=1)
@@ -598,7 +663,48 @@ class IMUGUI:
                 self.update_status("파일 저장 실패", 'danger')
                 messagebox.showerror("오류", f"파일 저장 실패:\n{e}")
 
-    # ----------------- 로컬 SQLite 업로드 -----------------
+    # ----------------- API 로그인 -----------------
+    def _get_api_base(self):
+        url = (self.api_base_var.get() or "").strip().rstrip("/")
+        return url or "http://127.0.0.1:8000"
+
+    def login_via_api(self):
+        # 커스텀 다이얼로그로 이메일/비밀번호를 한 번에 입력
+        dlg = LoginDialog(self.root, "로그인")
+        email = dlg.email
+        password = dlg.password
+        if not email or password is None:
+            # 사용자가 취소를 눌렀거나 입력이 없을 때
+            return
+
+        base = self._get_api_base()
+        try:
+            self.update_status("로그인 중...", "info")
+            resp = requests.post(f"{base}/auth/login",
+                                 json={"email": email, "password": password},
+                                 timeout=10)
+            if resp.status_code != 200:
+                try:
+                    msg = resp.json().get("detail", resp.text)
+                except Exception:
+                    msg = resp.text
+                self.update_status("로그인 실패", "danger")
+                messagebox.showerror("로그인 실패", f"{resp.status_code}: {msg}")
+                return
+
+            data = resp.json()
+            self.auth_token = data.get("token")
+            self.user_summary = data.get("summary", {})
+            display_name = self.user_summary.get("name") or self.user_summary.get("email") or "user"
+            self.operator_name_var.set(display_name)
+
+            self.update_status(f"로그인 성공: {display_name}", "success")
+            messagebox.showinfo("성공", f"{display_name}님, 환영합니다!\n로그인 토큰이 설정되었습니다.")
+        except Exception as e:
+            self.update_status("로그인 중 오류", "danger")
+            messagebox.showerror("오류", f"로그인 실패:\n{e}")
+
+    # ----------------- 로컬 SQLite 업로드 + API 업로드 -----------------
     @staticmethod
     def _sqlite_path_from_url(url_text: str) -> str:
         """
@@ -682,11 +788,9 @@ class IMUGUI:
 
     def save_to_database(self):
         """
-        로컬 SQLite DB URL에 예측 드리프트 업로드.
-        - DB URL 입력값을 파일 경로로 파싱
-        - 최소 스키마 보장(user, imurecord)
-        - user 'admin' 확보 후, 센서별로 1건씩 imurecord insert
-        - Destination은 'Room3' 고정, Arrived는 항상 True(1)
+        저장 동작:
+        - ✅ 로그인(토큰 보유) 상태면: API POST /imu 로 업로드 (inspector_id는 로그인 사용자로 자동 반영)
+        - 비로그인 상태면: 기존 로컬 SQLite에 직접 insert (레거시 호환)
         """
         with self.data_lock:
             has_data = bool(self.data_records)
@@ -696,7 +800,66 @@ class IMUGUI:
             messagebox.showwarning("경고", "예측 결과가 없습니다. 먼저 자동 측정을 실행하거나 예측을 완료하세요.")
             return
 
-        # DB 경로 파싱
+        # 공통 입력값
+        inspected_at = (self.collection_start_time.isoformat()
+                        if self.collection_start_time else datetime.utcnow().isoformat())
+        destination = "Room3"
+        arrived = True
+        box_no = None
+        box_no_text = (self.upload_box_no_var.get() or "").strip()
+        if box_no_text:
+            try:
+                box_no = int(box_no_text)
+            except ValueError:
+                messagebox.showwarning("입력 오류", "Box No는 숫자여야 합니다.")
+                return
+
+        # ✅ 1) 로그인 상태면 API 업로드
+        if self.auth_token:
+            base = self._get_api_base()
+            headers = {"X-Auth-Token": self.auth_token}
+            success, failed = 0, 0
+            failures = []
+
+            self.update_status("API로 업로드 중...", "info")
+            for sensor_id, pred in sorted(self.predictions_data.items()):
+                try:
+                    payload = {
+                        "serial": f"SENSOR-{sensor_id:02d}",
+                        "inspected_at": inspected_at,
+                        "passed": (not bool(pred.get("is_faulty", False))),
+                        "box_no": box_no,
+                        "destination": destination,
+                        "arrived": arrived,
+                        "roll": pred.get("roll_drift"),
+                        "pitch": pred.get("pitch_drift"),
+                        "yaw": pred.get("yaw_drift"),
+                    }
+                    resp = requests.post(f"{base}/imu", json=payload, headers=headers, timeout=10)
+                    if resp.status_code in (200, 201):
+                        success += 1
+                    else:
+                        try:
+                            msg = resp.json().get("detail", resp.text)
+                        except Exception:
+                            msg = resp.text
+                        failed += 1
+                        failures.append(f"센서 {sensor_id}: {resp.status_code} {msg}")
+                except Exception as e:
+                    failed += 1
+                    failures.append(f"센서 {sensor_id}: {e}")
+
+            if failed == 0:
+                self.update_status(f"API 업로드 완료({success}건)", "success")
+                messagebox.showinfo("성공", f"API 업로드 완료!\n- 업로드 성공: {success}건")
+            else:
+                self.update_status(f"일부 업로드 실패: 성공 {success} / 실패 {failed}", "warning")
+                detail = "\n".join(failures[:5]) + ("\n..." if len(failures) > 5 else "")
+                messagebox.showwarning("부분 실패",
+                                       f"일부 업로드에 실패했습니다.\n- 성공: {success}\n- 실패: {failed}\n\n상세:\n{detail}")
+            return
+
+        # 🔁 2) 비로그인 상태: 로컬 SQLite (레거시)
         db_path = self._sqlite_path_from_url(self.db_url_var.get())
         try:
             os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
@@ -707,28 +870,13 @@ class IMUGUI:
             conn = sqlite3.connect(db_path, timeout=30)
             conn.execute("BEGIN")
             self._ensure_min_schema(conn)
-            admin_id = self._get_or_create_admin_id(conn)
+            admin_id = self._get_or_create_admin_id(conn)   # 레거시: admin 계정
             conn.commit()
         except Exception as e:
             try: conn.rollback()
             except: pass
             messagebox.showerror("DB 오류", f"DB 초기화 실패:\n{e}")
             return
-
-        inspected_at = (self.collection_start_time.isoformat()
-                        if self.collection_start_time else datetime.utcnow().isoformat())
-        destination = "Room3"   # Destination 고정
-        arrived = 1             # 업로드 성공 시 항상 True로 저장
-        # Box No
-        box_no = None
-        box_no_text = (self.upload_box_no_var.get() or "").strip()
-        if box_no_text:
-            try:
-                box_no = int(box_no_text)
-            except ValueError:
-                messagebox.showwarning("입력 오류", "Box No는 숫자여야 합니다.")
-                conn.close()
-                return
 
         success, failed = 0, 0
         failures = []
@@ -746,7 +894,7 @@ class IMUGUI:
                         INSERT INTO imurecord
                         (code, serial, inspected_at, passed, inspector_id, box_no, destination, arrived, roll, pitch, yaw, created_at, updated_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """, (code, serial, inspected_at, passed, admin_id, box_no, destination, arrived,
+                    """, (code, serial, inspected_at, passed, admin_id, box_no, destination, 1 if arrived else 0,
                           float(roll_val) if roll_val is not None else None,
                           float(pitch_val) if pitch_val is not None else None,
                           float(yaw_val) if yaw_val is not None else None))
